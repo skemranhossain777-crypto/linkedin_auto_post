@@ -3,12 +3,19 @@
 // share code that could break one when changing the other. Follows
 // .claude/skills/social-post/platforms/linkedin.md exactly.
 
-function currentLinkedInVersion(): string {
+// LinkedIn activates each month's API version a few days into that month, so
+// the current calendar month isn't guaranteed to be live yet — callers should
+// probe backwards a couple of months on NONEXISTENT_VERSION rather than
+// assuming this always works.
+function linkedInVersionForOffset(monthsBack: number): string {
   const now = new Date();
-  const year = now.getUTCFullYear();
-  const month = String(now.getUTCMonth() + 1).padStart(2, "0");
+  const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - monthsBack, 1));
+  const year = d.getUTCFullYear();
+  const month = String(d.getUTCMonth() + 1).padStart(2, "0");
   return `${year}${month}`;
 }
+
+class LinkedInVersionError extends Error {}
 
 async function getAccessToken(): Promise<string> {
   const clientId = process.env.LINKEDIN_CLIENT_ID;
@@ -60,7 +67,11 @@ async function initializeImageUpload(
     body: JSON.stringify({ initializeUploadRequest: { owner: authorUrn } }),
   });
   if (!res.ok) {
-    throw new Error(`LinkedIn initializeUpload failed: ${res.status} ${await res.text()}`);
+    const text = await res.text();
+    if (res.status === 426 && text.includes("NONEXISTENT_VERSION")) {
+      throw new LinkedInVersionError(`LinkedIn-Version ${version} is not active: ${text}`);
+    }
+    throw new Error(`LinkedIn initializeUpload failed: ${res.status} ${text}`);
   }
   const json = (await res.json()) as { value: { uploadUrl: string; image: string } };
   return json.value;
@@ -130,9 +141,25 @@ export async function publishToLinkedIn(
   if (!authorUrn) throw new Error("LINKEDIN_AUTHOR_URN is not set");
 
   const accessToken = await getAccessToken();
-  const version = currentLinkedInVersion();
 
-  const { uploadUrl, image } = await initializeImageUpload(accessToken, authorUrn, version);
-  await uploadImage(uploadUrl, accessToken, png);
-  return createPost(accessToken, authorUrn, version, caption, image, mediaTitle);
+  const MAX_MONTHS_BACK = 2;
+  let uploadResult: { uploadUrl: string; image: string } | undefined;
+  let version = "";
+  let lastError: unknown;
+  for (let monthsBack = 0; monthsBack <= MAX_MONTHS_BACK; monthsBack++) {
+    version = linkedInVersionForOffset(monthsBack);
+    try {
+      uploadResult = await initializeImageUpload(accessToken, authorUrn, version);
+      break;
+    } catch (err) {
+      if (!(err instanceof LinkedInVersionError)) throw err;
+      lastError = err;
+    }
+  }
+  if (!uploadResult) {
+    throw lastError instanceof Error ? lastError : new Error("No active LinkedIn-Version found");
+  }
+
+  await uploadImage(uploadResult.uploadUrl, accessToken, png);
+  return createPost(accessToken, authorUrn, version, caption, uploadResult.image, mediaTitle);
 }
